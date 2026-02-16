@@ -13,7 +13,7 @@ import IMG "vendor:sdl2/image"
 WINDOW_WIDTH :: 1200
 WINDOW_HEIGHT :: 800
 
-FRAME_TIME_MS :: 1000.0 / 60.0 * f64(time.Millisecond)
+FRAME_TIME_MS :: 1000.0 / 144.0 * f64(time.Millisecond)
 
 ASSET_SIZE :: 64
 
@@ -45,6 +45,57 @@ render_copy :: proc(
 	return
 }
 
+render_tower :: proc(
+	renderer: ^SDL.Renderer,
+	textures: map[TileType]^SDL.Texture,
+	dst_point: SDL.Point,
+	angle_point: ^SDL.Point,
+) -> (
+	err: Error,
+	ok: bool,
+) {
+	base_dst_rect := SDL.Rect {
+		x = dst_point.x,
+		y = dst_point.y,
+		w = TILE_ASSET_SIZE,
+		h = TILE_ASSET_SIZE,
+	}
+	render_copy(renderer, textures[.Base], nil, &base_dst_rect) or_return
+
+	tower_dst_rect := base_dst_rect
+	tower_dst_rect.y -= 5
+
+	if angle_point != nil {
+		tower_center_point := SDL.Point {
+			x = TILE_ASSET_SIZE / 2,
+			y = TILE_ASSET_SIZE / 2 + 5,
+		}
+
+		x_diff := f64(angle_point.x - (tower_dst_rect.x + tower_center_point.x))
+		y_diff := f64(angle_point.y - (tower_dst_rect.y + tower_center_point.y))
+		angle := 90 + math.to_degrees(math.atan2(y_diff, x_diff))
+
+		if SDL.RenderCopyEx(
+			   renderer,
+			   textures[.Tower],
+			   nil,
+			   &tower_dst_rect,
+			   angle,
+			   &tower_center_point,
+			   .NONE,
+		   ) !=
+		   0 {
+			err = .Texture
+			return
+		}
+	} else {
+		render_copy(renderer, textures[.Tower], nil, &tower_dst_rect) or_return
+	}
+
+	ok = true
+	return
+}
+
 level: string = `
 xxxxx#xxxx
 xxxxx#####
@@ -57,6 +108,12 @@ x#####xxxx
 x#xxxxxxxx
 x#xxxxxxxx
 `
+
+
+MAP_TILE_COUNT :: 10
+TILE_ASSET_SIZE :: ASSET_SIZE / 2
+MAP_SIZE :: MAP_TILE_COUNT * 2 * TILE_ASSET_SIZE
+TILE_SIZE :: TILE_ASSET_SIZE * 2
 
 
 TileType :: enum {
@@ -213,11 +270,6 @@ main :: proc() {
 		textures[.Tree2],
 	}
 
-	MAP_TILE_COUNT :: 10
-	TILE_ASSET_SIZE :: ASSET_SIZE / 2
-	MAP_SIZE :: MAP_TILE_COUNT * 2 * TILE_ASSET_SIZE
-	TILE_SIZE :: TILE_ASSET_SIZE * 2
-
 	x_start := window_width / 2 - MAP_SIZE / 2
 	y_start := window_height / 2 - MAP_SIZE / 2
 
@@ -226,12 +278,11 @@ main :: proc() {
 	higlight: bool
 	click_asset_x, click_asset_y: i32
 
-	mouse_x, mouse_y: i32
-
-	// angle: f64 = 0
+	mouse_pos: SDL.Point
+	space_pressed: bool
+	zoom: f32 = 1.0
 
 	err: Error
-
 
 	loop: for {
 		// input
@@ -240,9 +291,20 @@ main :: proc() {
 		event: SDL.Event
 		for SDL.PollEvent(&event) {
 			#partial switch event.type {
+			case .KEYDOWN:
+				#partial switch event.key.keysym.sym {
+				case .SPACE:
+					space_pressed = true
+				}
+			case .KEYUP:
+				#partial switch event.key.keysym.sym {
+				case .SPACE:
+					space_pressed = false
+				}
 			case .MOUSEBUTTONDOWN:
 				if event.button.button == 1 {
-					mouse_x, mouse_y := event.button.x, event.button.y
+					mouse_x := i32(f32(event.button.x) / zoom)
+					mouse_y := i32(f32(event.button.y) / zoom)
 
 					map_x := mouse_x - x_start
 					map_y := mouse_y - y_start
@@ -254,7 +316,29 @@ main :: proc() {
 					}
 				}
 			case .MOUSEMOTION:
-				mouse_x, mouse_y = event.motion.x, event.motion.y
+				prev_mouse_pos := mouse_pos
+				mouse_pos.x, mouse_pos.y = event.motion.x, event.motion.y
+
+				if space_pressed {
+					x_diff := f32(prev_mouse_pos.x - mouse_pos.x) / zoom
+					y_diff := f32(prev_mouse_pos.y - mouse_pos.y) / zoom
+					x_start -= i32(x_diff)
+					y_start -= i32(y_diff)
+				}
+			case .MOUSEWHEEL:
+				prev_zoom := zoom
+
+				zoom += f32(event.wheel.y) * 0.05
+				zoom = clamp(zoom, 0.25, 5)
+
+
+				x_start = i32(
+					f32(mouse_pos.x) / zoom - (f32(mouse_pos.x) / prev_zoom - f32(x_start)),
+				)
+				y_start = i32(
+					f32(mouse_pos.y) / zoom - (f32(mouse_pos.y) / prev_zoom - f32(y_start)),
+				)
+
 			case .QUIT:
 				return
 			}
@@ -266,6 +350,11 @@ main :: proc() {
 
 
 		render_start := time.tick_now()
+
+		if SDL.RenderSetScale(renderer, zoom, zoom) != 0 {
+			err = .Texture
+			break
+		}
 
 		err = set_render_clr(renderer, bg_clr) or_break
 		if SDL.RenderClear(renderer) != 0 {
@@ -437,37 +526,15 @@ main :: proc() {
 		// click
 
 		if higlight {
-			texture_base := textures[.Base]
-			texture_tower := textures[.Tower]
-
-			base_dst_rect := SDL.Rect {
+			dst := SDL.Point {
 				x_start + click_asset_x * TILE_ASSET_SIZE,
 				y_start + click_asset_y * TILE_ASSET_SIZE,
-				TILE_ASSET_SIZE,
-				TILE_ASSET_SIZE,
 			}
-			err = render_copy(renderer, texture_base, nil, &base_dst_rect) or_break loop
-
-			tower_dst_rect := base_dst_rect
-			tower_dst_rect.y -= 5
-
-			p := SDL.Point {
-				x = TILE_ASSET_SIZE / 2,
-				y = TILE_ASSET_SIZE / 2 + 5,
+			logical_mouse_pos := SDL.Point {
+				x = i32(f32(mouse_pos.x) / zoom),
+				y = i32(f32(mouse_pos.y) / zoom),
 			}
-
-			x_diff := f64(mouse_x - (tower_dst_rect.x + p.x))
-			y_diff := f64(mouse_y - (tower_dst_rect.y + p.y))
-			angle := 90 + math.to_degrees(math.atan2(y_diff, x_diff))
-
-			if SDL.RenderCopyEx(renderer, texture_tower, nil, &tower_dst_rect, angle, &p, .NONE) !=
-			   0 {
-				err = .Texture
-				break loop
-			}
-
-
-			// err = render_copy(renderer, texture_tower, nil, &tower_dst_rect) or_break loop
+			err = render_tower(renderer, textures, dst, &logical_mouse_pos) or_break loop
 		}
 
 		SDL.RenderPresent(renderer)
