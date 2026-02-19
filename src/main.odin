@@ -18,7 +18,10 @@ WINDOW_HEIGHT :: 800
 FRAME_TIME_MS :: 1000.0 / 144.0 * f64(time.Millisecond)
 
 ASSET_SIZE :: 64
+
 TILE_SIZE :: 32
+TOWER_RANGE_RADIUS :: TILE_SIZE * 3
+ENEMY_PX_PER_SECOND :: TILE_SIZE * 2
 
 SDL_Error :: struct {
 	loc: runtime.Source_Code_Location,
@@ -110,19 +113,23 @@ Mouse :: struct {
 }
 
 Context :: struct {
-	window:        ^SDL.Window,
-	renderer:      ^SDL.Renderer,
-	frame_time:    time.Duration,
-	textures:      map[Texture]^SDL.Texture,
+	window:                ^SDL.Window,
+	renderer:              ^SDL.Renderer,
+	frame_time:            time.Duration,
+	textures:              map[Texture]^SDL.Texture,
 
 	//
-	window_width:  i32,
-	window_height: i32,
-	zoom:          f32,
-	mouse:         Mouse,
+	window_width:          i32,
+	window_height:         i32,
+	zoom:                  f32,
+	mouse:                 Mouse,
+	dt:                    f32,
 
 	// clr
-	bg_clr:        SDL.Color,
+	bg_clr:                SDL.Color,
+	highlight_error_clr:   SDL.Color,
+	highlight_success_clr: SDL.Color,
+	point_clr:             SDL.Color,
 }
 
 TextureGround :: enum {
@@ -162,6 +169,7 @@ TextureEntity :: enum {
 	CardTower, // 038
 	Base, // 180
 	Tower, // 250
+	Enemy, // 245
 }
 
 TextureDecoration :: enum {
@@ -180,12 +188,29 @@ Texture :: union {
 TileGround :: struct {
 	texture:    TextureGround,
 	decoration: TextureDecoration,
-	tower:      TextureEntity,
 }
 
-Tile :: union {
+TileType :: union {
 	TileGround,
 	TextureRoad,
+}
+
+Tile :: struct {
+	row, col: i32,
+	type:     TileType,
+}
+
+Tower :: struct {
+	row, col: i32,
+}
+
+PathEndpoint :: struct {
+	col, row: i32,
+}
+
+Enemy :: struct {
+	using _:      SDL.FPoint,
+	endpoint_idx: int,
 }
 
 Level :: struct {
@@ -193,9 +218,20 @@ Level :: struct {
 	cols, rows:   int,
 	tiles:        [dynamic]Tile,
 	hovered_tile: int,
+	towers:       [dynamic]Tower,
+	path:         []PathEndpoint,
+	enemy:        Enemy,
 }
 
-level_init :: proc(level: ^Level, level_map: string, allocator := context.allocator) {
+level_init :: proc(
+	level: ^Level,
+	level_map: string,
+	path: []PathEndpoint,
+	allocator := context.allocator,
+) {
+	level.hovered_tile = -1
+	level.path = path
+
 	level_map := strings.trim_space(level_map)
 	map_rows, map_cols: int
 
@@ -219,15 +255,18 @@ level_init :: proc(level: ^Level, level_map: string, allocator := context.alloca
 	level.w = i32(level.cols) * TILE_SIZE
 	level.h = i32(level.rows) * TILE_SIZE
 	level.tiles = make([dynamic]Tile, level.rows * level.cols)
+	level.towers = make([dynamic]Tower)
 
-	set_tiles :: proc(level: ^Level, row, col: int, lt, rt, lb, rb: Tile) {
+	set_tiles :: proc(level: ^Level, row, col: int, lt, rt, lb, rb: TileType) {
+		r, c := i32(row), i32(col)
+
 		t_idx := row * level.cols + col
-		level.tiles[t_idx] = lt // left top
-		level.tiles[t_idx + 1] = rt // right top
+		level.tiles[t_idx] = Tile{r, c, lt} // left top
+		level.tiles[t_idx + 1] = Tile{r, c + 1, rt} // right top
 
 		b_idx := (row + 1) * level.cols + col
-		level.tiles[b_idx] = lb // left bottom
-		level.tiles[b_idx + 1] = rb // right bottom
+		level.tiles[b_idx] = Tile{r + 1, c, lb} // left bottom
+		level.tiles[b_idx + 1] = Tile{r + 1, c + 1, rb} // right bottom
 	}
 
 	row, col := 0, 0
@@ -314,6 +353,56 @@ ui_coords :: proc(ui: ^Ui, ctx: ^Context) {
 	ui.y = ctx.window_height / 2 - (ui.cards * ui.card_h + ui.padding * (ui.cards - 2)) / 2
 }
 
+render_circle :: proc(ctx: ^Context, color: SDL.Color, cx, cy, r: i32) -> (err: Error) {
+	x: i32 = 0
+	y := -r
+	ymp := -(f32(r) - 0.5)
+
+	sdl_exec(SDL.SetRenderDrawColor(ctx.renderer, expand_values(color))) or_return
+
+	for x < -y {
+		sdl_exec(SDL.RenderDrawPoint(ctx.renderer, cx + x, cy + y)) or_return
+		sdl_exec(SDL.RenderDrawPoint(ctx.renderer, cx + x, cy - y)) or_return
+		sdl_exec(SDL.RenderDrawPoint(ctx.renderer, cx - x, cy + y)) or_return
+		sdl_exec(SDL.RenderDrawPoint(ctx.renderer, cx - x, cy - y)) or_return
+
+		sdl_exec(SDL.RenderDrawPoint(ctx.renderer, cx + y, cy + x)) or_return
+		sdl_exec(SDL.RenderDrawPoint(ctx.renderer, cx - y, cy + x)) or_return
+		sdl_exec(SDL.RenderDrawPoint(ctx.renderer, cx + y, cy - x)) or_return
+		sdl_exec(SDL.RenderDrawPoint(ctx.renderer, cx - y, cy - x)) or_return
+
+		x += 1
+		if f32(x * x) + ymp * ymp > f32(r * r) {
+			y += 1
+			ymp += 1
+		}
+	}
+
+	return
+}
+
+render_tower :: proc(ctx: ^Context, rect: SDL.Rect, show_range: bool) -> (err: Error) {
+	rect := rect
+	sdl_exec(SDL.RenderCopy(ctx.renderer, ctx.textures[.Base], nil, &rect)) or_return
+
+	tower_r := rect
+	tower_r.y -= 5
+	sdl_exec(SDL.RenderCopy(ctx.renderer, ctx.textures[.Tower], nil, &tower_r)) or_return
+
+	if show_range {
+		cx, cy := rect.x + rect.w / 2, rect.y + rect.h / 2
+		render_circle(ctx, SDL.Color{255, 0, 0, 255}, cx, cy, TOWER_RANGE_RADIUS) or_return
+	}
+
+	return
+}
+
+position_to_pixels :: proc(level: ^Level, col, row, w, h: i32) -> (x, y: i32) {
+	x = level.x + col * w
+	y = level.y + row * h
+	return
+}
+
 render :: proc(ctx: ^Context, level: ^Level, ui: ^Ui) -> (err: Error) {
 	render_start := time.tick_now()
 	defer {
@@ -330,67 +419,98 @@ render :: proc(ctx: ^Context, level: ^Level, ui: ^Ui) -> (err: Error) {
 	sdl_exec(SDL.RenderClear(ctx.renderer)) or_return
 
 	{ 	// render level
-		texture_rect := SDL.Rect {
+		r := SDL.Rect {
 			w = TILE_SIZE,
 			h = TILE_SIZE,
 		}
 
 		for tile, idx in level.tiles {
-			row := idx / level.rows
-			col := idx - level.cols * row
+			r.x, r.y = position_to_pixels(level, tile.col, tile.row, TILE_SIZE, TILE_SIZE)
 
-			texture_rect.x = level.x + i32(col) * TILE_SIZE
-			texture_rect.y = level.y + i32(row) * TILE_SIZE
-
-			highlight_clr: SDL.Color
-
-			switch t in tile {
+			switch t in tile.type {
 			case TileGround:
-				sdl_exec(
-					SDL.RenderCopy(ctx.renderer, ctx.textures[t.texture], nil, &texture_rect),
-				) or_return
+				sdl_exec(SDL.RenderCopy(ctx.renderer, ctx.textures[t.texture], nil, &r)) or_return
 
-				if t.decoration != nil {
+				if t.decoration != .None {
 					sdl_exec(
-						SDL.RenderCopy(
-							ctx.renderer,
-							ctx.textures[t.decoration],
-							nil,
-							&texture_rect,
-						),
-					) or_return
-					highlight_clr = SDL.Color{255, 100, 100, 100}
-				} else {
-					highlight_clr = SDL.Color{100, 255, 100, 100}
-				}
-
-				#partial switch t.tower {
-				case .Tower:
-					sdl_exec(
-						SDL.RenderCopy(ctx.renderer, ctx.textures[.Base], nil, &texture_rect),
-					) or_return
-
-					tower_r := texture_rect
-					tower_r.y -= 5
-					sdl_exec(
-						SDL.RenderCopy(ctx.renderer, ctx.textures[.Tower], nil, &tower_r),
+						SDL.RenderCopy(ctx.renderer, ctx.textures[t.decoration], nil, &r),
 					) or_return
 				}
 			case TextureRoad:
-				sdl_exec(
-					SDL.RenderCopy(ctx.renderer, ctx.textures[t], nil, &texture_rect),
-				) or_return
-				highlight_clr = SDL.Color{255, 100, 100, 100}
-			}
-
-			if idx == level.hovered_tile {
-				sdl_exec(
-					SDL.SetRenderDrawColor(ctx.renderer, expand_values(highlight_clr)),
-				) or_return
-				sdl_exec(SDL.RenderFillRect(ctx.renderer, &texture_rect)) or_return
+				sdl_exec(SDL.RenderCopy(ctx.renderer, ctx.textures[t], nil, &r)) or_return
 			}
 		}
 	}
+
+	{ 	// render path
+		sdl_exec(SDL.SetRenderDrawColor(ctx.renderer, expand_values(ctx.point_clr))) or_return
+
+		x1, y1: i32
+		for p, i in level.path {
+			x2, y2 := position_to_pixels(level, p.col, p.row, TILE_SIZE, TILE_SIZE)
+			x2 += TILE_SIZE
+			y2 += TILE_SIZE
+
+			if i > 0 {
+				sdl_exec(SDL.RenderDrawLine(ctx.renderer, x1, y1, x2, y2)) or_return
+			}
+
+			x1, y1 = x2, y2
+		}
+	}
+
+	{ 	// render towers
+		r := SDL.Rect {
+			w = TILE_SIZE,
+			h = TILE_SIZE,
+		}
+		for tower in level.towers {
+			r.x, r.y = position_to_pixels(level, tower.col, tower.row, TILE_SIZE, TILE_SIZE)
+			render_tower(ctx, r, true) or_return
+		}
+	}
+
+	{ 	// render enemies
+		r := SDL.FRect {
+			x = level.enemy.x,
+			y = level.enemy.y,
+			w = TILE_SIZE,
+			h = TILE_SIZE,
+		}
+		sdl_exec(SDL.RenderCopyF(ctx.renderer, ctx.textures[.Enemy], nil, &r)) or_return
+	}
+
+	// highlight
+	if level.hovered_tile > -1 {
+		tile := level.tiles[level.hovered_tile]
+		highlight_clr := ctx.highlight_error_clr
+
+		#partial switch t in tile.type {
+		case TileGround:
+			if t.decoration == .None {
+				found := false
+				for tower in level.towers {
+					if tower.row == tile.row && tower.col == tile.col {
+						found = true
+						break
+					}
+				}
+				if !found {
+					highlight_clr = ctx.highlight_success_clr
+				}
+			}
+		}
+
+		r := SDL.Rect {
+			w = TILE_SIZE,
+			h = TILE_SIZE,
+		}
+		r.x, r.y = position_to_pixels(level, tile.col, tile.row, TILE_SIZE, TILE_SIZE)
+
+		sdl_exec(SDL.SetRenderDrawColor(ctx.renderer, expand_values(highlight_clr))) or_return
+		sdl_exec(SDL.RenderFillRect(ctx.renderer, &r)) or_return
+	}
+
 
 	{ 	// render ui
 		mouse_x, mouse_y := ctx.mouse.x, ctx.mouse.y
@@ -436,11 +556,7 @@ render :: proc(ctx: ^Context, level: ^Level, ui: ^Ui) -> (err: Error) {
 				w = tower_w,
 				h = tower_h,
 			}
-			sdl_exec(SDL.RenderCopy(ctx.renderer, ctx.textures[.Base], nil, &base_r)) or_return
-
-			tower_r := base_r
-			tower_r.y -= 5
-			sdl_exec(SDL.RenderCopy(ctx.renderer, ctx.textures[.Tower], nil, &tower_r)) or_return
+			render_tower(ctx, base_r, i == ui.card_clicked) or_return
 		}
 	}
 
@@ -468,6 +584,11 @@ main :: proc() {
 	renderer := SDL.CreateRenderer(window, -1, {.ACCELERATED})
 	if renderer == nil {
 		fmt.eprintln("failed to create renderer: ", SDL.GetErrorString())
+		return
+	}
+
+	if err := sdl_exec(SDL.SetRenderDrawBlendMode(renderer, .BLEND)); err != nil {
+		fmt.eprintln(error_string(err))
 		return
 	}
 
@@ -531,6 +652,9 @@ main :: proc() {
 				texture_key = .Tower
 			case "towerDefense_tile038.png":
 				texture_key = .CardTower
+			// enemies
+			case "towerDefense_tile245.png":
+				texture_key = .Enemy
 			case:
 				continue
 			}
@@ -573,12 +697,15 @@ main :: proc() {
 	}
 
 	ctx := Context {
-		window        = window,
-		renderer      = renderer,
-		window_width  = window_width,
-		window_height = window_height,
-		textures      = textures,
-		bg_clr        = SDL.Color{110, 150, 200, 255},
+		window                = window,
+		renderer              = renderer,
+		window_width          = window_width,
+		window_height         = window_height,
+		textures              = textures,
+		bg_clr                = SDL.Color{110, 150, 200, 255},
+		highlight_error_clr   = SDL.Color{255, 100, 100, 200},
+		highlight_success_clr = SDL.Color{100, 255, 100, 100},
+		point_clr             = SDL.Color{100, 100, 255, 255},
 	}
 
 	levelTiles: string =
@@ -592,12 +719,25 @@ main :: proc() {
 		"x#####xxxx\n" +
 		"x#xxxxxxxx\n" +
 		"x#xxxxxxxx\n"
-
-
-	level := Level {
-		hovered_tile = -1,
+	levelPath := []PathEndpoint {
+		{10, -1},
+		{10, 2},
+		{18, 2},
+		{18, 10},
+		{6, 10},
+		{6, 6},
+		{10, 6},
+		{10, 14},
+		{2, 14},
+		{2, 19},
 	}
-	level_init(&level, levelTiles)
+
+
+	level: Level
+	level.enemy = Enemy {
+		endpoint_idx = -1,
+	}
+	level_init(&level, levelTiles, levelPath)
 	level_coords(&level, &ctx)
 
 	ui := Ui {
@@ -610,9 +750,14 @@ main :: proc() {
 	ui_coords(&ui, &ctx)
 
 	err: Error
+	last_tick := time.tick_now()
 
 	loop: for {
 		frame_start := time.tick_now()
+
+		frame_dt := time.tick_since(last_tick)
+		ctx.dt = min(f32(time.duration_seconds(frame_dt)), 1.0 / 20.0) // clamp to 50ms as max dt
+		last_tick = frame_start
 
 		// inputs
 
@@ -637,7 +782,7 @@ main :: proc() {
 			// buttons
 			switch {
 			case btn & SDL.BUTTON_LMASK != 0:
-				// left btn pressed
+				// button down
 				if ui.card_clicked < 0 {
 					ui_mouse_x, ui_mouse_y := mouse_x - ui.x, mouse_y - ui.y
 					card_x, card_y: i32
@@ -659,13 +804,22 @@ main :: proc() {
 					}
 				}
 			case btn & SDL.BUTTON_LMASK == 0 && ctx.mouse.btn & SDL.BUTTON_LMASK != 0:
+				// button up
 				if ui.card_clicked >= 0 {
 					if level.hovered_tile > -1 {
 						tile := &level.tiles[level.hovered_tile]
 
-						if t, ok := &tile.(TileGround);
-						   ok && t.decoration == .None && t.tower == .None {
-							t.tower = .Tower
+						if t, ok := tile.type.(TileGround); ok && t.decoration == .None {
+							exists := false
+							for tower in level.towers {
+								if tower.row == tile.row && tower.col == tile.col {
+									exists = true
+									break
+								}
+							}
+							if !exists {
+								append(&level.towers, Tower{row = tile.row, col = tile.col})
+							}
 						}
 
 						level.hovered_tile = -1
@@ -702,6 +856,65 @@ main :: proc() {
 
 			ctx.mouse.btn = btn
 			ctx.mouse.x, ctx.mouse.y = mouse_x, mouse_y
+		}
+
+		// update
+
+		{ 	// enemy
+			enemy := &level.enemy
+
+			switch {
+			// not spawned
+			case enemy.endpoint_idx == -1:
+				x, y := position_to_pixels(
+					&level,
+					level.path[0].col,
+					level.path[0].row,
+					TILE_SIZE,
+					TILE_SIZE,
+				)
+				x += TILE_SIZE / 2
+				y += TILE_SIZE / 2
+
+				enemy.x = f32(x)
+				enemy.y = f32(y)
+				enemy.endpoint_idx += 1
+			// reached end
+			case enemy.endpoint_idx == len(level.path) - 1:
+
+			// moving
+			case:
+				from, to := level.path[enemy.endpoint_idx], level.path[enemy.endpoint_idx + 1]
+
+				fromx, fromy := position_to_pixels(
+					&level,
+					from.col,
+					from.row,
+					TILE_SIZE,
+					TILE_SIZE,
+				)
+				tox, toy := position_to_pixels(&level, to.col, to.row, TILE_SIZE, TILE_SIZE)
+
+				distance_x := clamp(f32(tox - fromx), -1, 1)
+				distance_y := clamp(f32(toy - fromy), -1, 1)
+
+				dx := distance_x * ENEMY_PX_PER_SECOND * ctx.dt
+				dy := distance_y * ENEMY_PX_PER_SECOND * ctx.dt
+
+				enemy.x += dx
+				enemy.y += dy
+
+				switch {
+				case distance_x < 0 && enemy.x <= f32(tox + TILE_SIZE / 2):
+					enemy.endpoint_idx += 1
+				case distance_x > 0 && enemy.x >= f32(tox + TILE_SIZE / 2):
+					enemy.endpoint_idx += 1
+				case distance_y > 0 && enemy.y >= f32(toy + TILE_SIZE / 2):
+					enemy.endpoint_idx += 1
+				case distance_y < 0 && enemy.y <= f32(toy + TILE_SIZE / 2):
+					enemy.endpoint_idx += 1
+				}
+			}
 		}
 
 		// render
