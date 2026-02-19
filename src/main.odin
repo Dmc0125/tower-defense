@@ -4,6 +4,7 @@ import "base:runtime"
 import "core:c"
 import "core:fmt"
 import "core:math"
+import "core:math/linalg"
 import "core:math/rand"
 import "core:os"
 import "core:strings"
@@ -11,6 +12,8 @@ import "core:time"
 
 import SDL "vendor:sdl2"
 import IMG "vendor:sdl2/image"
+
+Vec2 :: linalg.Vector2f32
 
 WINDOW_WIDTH :: 1200
 WINDOW_HEIGHT :: 800
@@ -20,6 +23,7 @@ FRAME_TIME_MS :: 1000.0 / 144.0 * f64(time.Millisecond)
 ASSET_SIZE :: 64
 
 TILE_SIZE :: 32
+PATH_SIZE :: TILE_SIZE * 2
 TOWER_RANGE_RADIUS :: TILE_SIZE * 3
 ENEMY_PX_PER_SECOND :: TILE_SIZE * 2
 
@@ -55,57 +59,6 @@ sdl_exec :: proc(res: c.int, msg := "", loc := #caller_location) -> (err: Error)
 	}
 	return
 }
-
-// render_tower :: proc(
-// 	renderer: ^SDL.Renderer,
-// 	textures: map[TileType]^SDL.Texture,
-// 	dst_point: SDL.Point,
-// 	angle_point: ^SDL.Point,
-// ) -> (
-// 	err: Error,
-// 	ok: bool,
-// ) {
-// 	base_dst_rect := SDL.Rect {
-// 		x = dst_point.x,
-// 		y = dst_point.y,
-// 		w = TILE_ASSET_SIZE,
-// 		h = TILE_ASSET_SIZE,
-// 	}
-// 	render_copy(renderer, textures[.Base], nil, &base_dst_rect) or_return
-//
-// 	tower_dst_rect := base_dst_rect
-// 	tower_dst_rect.y -= 5
-//
-// 	if angle_point != nil {
-// 		tower_center_point := SDL.Point {
-// 			x = TILE_ASSET_SIZE / 2,
-// 			y = TILE_ASSET_SIZE / 2 + 5,
-// 		}
-//
-// 		x_diff := f64(angle_point.x - (tower_dst_rect.x + tower_center_point.x))
-// 		y_diff := f64(angle_point.y - (tower_dst_rect.y + tower_center_point.y))
-// 		angle := 90 + math.to_degrees(math.atan2(y_diff, x_diff))
-//
-// 		if SDL.RenderCopyEx(
-// 			   renderer,
-// 			   textures[.Tower],
-// 			   nil,
-// 			   &tower_dst_rect,
-// 			   angle,
-// 			   &tower_center_point,
-// 			   .NONE,
-// 		   ) !=
-// 		   0 {
-// 			err = .Texture
-// 			return
-// 		}
-// 	} else {
-// 		render_copy(renderer, textures[.Tower], nil, &tower_dst_rect) or_return
-// 	}
-//
-// 	ok = true
-// 	return
-// }
 
 Mouse :: struct {
 	using _: SDL.Point,
@@ -195,23 +148,159 @@ TileType :: union {
 	TextureRoad,
 }
 
-Tile :: struct {
-	row, col: i32,
-	type:     TileType,
-}
 
-Tower :: struct {
-	row, col: i32,
-}
-
-PathEndpoint :: struct {
+Coords :: struct {
 	col, row: i32,
 }
 
-Enemy :: struct {
-	using _:      SDL.FPoint,
-	endpoint_idx: int,
+// converts coordinates to their absolute centered position in pixels based on their width and height
+coords_to_pixels_center :: proc(level: ^Level, coords: Coords, w, h: f32) -> (v: Vec2) {
+	v.x = f32(level.x) + f32(coords.col) * TILE_SIZE + w / 2
+	v.y = f32(level.y) + f32(coords.row) * TILE_SIZE + h / 2
+	return
 }
+
+Tile :: struct {
+	using _: Coords,
+	type:    TileType,
+}
+
+Tower :: struct {
+	using _:            Coords,
+	angle:              f32,
+	range_radius:       f32,
+	shooting_frequency: time.Duration,
+	last_shot:          time.Tick,
+	damage:             f32,
+}
+
+tower_init :: proc(tower: ^Tower, coords: Coords) {
+	tower.col = coords.col
+	tower.row = coords.row
+	tower.range_radius = TOWER_RANGE_RADIUS
+	tower.shooting_frequency = time.Second
+	tower.damage = 20
+}
+
+tower_render :: proc(ctx: ^Context, level: ^Level, tower: ^Tower) -> (err: Error) {
+	w, h :: TILE_SIZE, TILE_SIZE
+	pos := coords_to_pixels_center(level, tower, w, h)
+
+	base_rect := SDL.FRect {
+		x = pos.x - w / 2,
+		y = pos.y - h / 2,
+		w = w,
+		h = h,
+	}
+	sdl_exec(SDL.RenderCopyF(ctx.renderer, ctx.textures[.Base], nil, &base_rect)) or_return
+
+	tower_rect := base_rect
+	tower_rect.y -= 5
+
+	cpoint := SDL.FPoint {
+		x = w / 2,
+		y = h / 2 + 5,
+	}
+
+	sdl_exec(
+		SDL.RenderCopyExF(
+			ctx.renderer,
+			ctx.textures[.Tower],
+			nil,
+			&tower_rect,
+			f64(tower.angle),
+			&cpoint,
+			.NONE,
+		),
+	) or_return
+
+	render_circle(
+		ctx,
+		SDL.Color{255, 100, 100, 255},
+		expand_values(pos),
+		TOWER_RANGE_RADIUS,
+	) or_return
+
+	return
+}
+
+Enemy :: struct {
+	// relative tile center position from the start of path
+	rel_pos:      Vec2,
+	angle:        f32,
+	endpoint_idx: int,
+	max_health:   f32,
+	health:       f32,
+}
+
+
+// converts enemy relative position to absolute center positon in pixels
+enemy_abs_position :: proc(level: ^Level, enemy: ^Enemy) -> (v: Vec2, ok: bool) {
+	idx := enemy.endpoint_idx
+	if idx < 0 || idx >= len(level.path) - 1 {
+		return
+	}
+
+	abs_path_pos := coords_to_pixels_center(level, level.path[idx], PATH_SIZE, PATH_SIZE)
+	v = abs_path_pos + enemy.rel_pos
+	ok = true
+	return
+}
+
+enemy_render :: proc(ctx: ^Context, level: ^Level, enemy: ^Enemy) -> (err: Error) {
+	abs_pos, ok := enemy_abs_position(level, enemy)
+	if !ok {
+		return
+	}
+
+	// texture
+
+	texture_rect := SDL.FRect {
+		x = abs_pos.x - TILE_SIZE / 2,
+		y = abs_pos.y - TILE_SIZE / 2,
+		w = TILE_SIZE,
+		h = TILE_SIZE,
+	}
+	texture_center := SDL.FPoint{TILE_SIZE / 2, TILE_SIZE / 2}
+	sdl_exec(
+		SDL.RenderCopyExF(
+			ctx.renderer,
+			ctx.textures[.Enemy],
+			nil,
+			&texture_rect,
+			f64(enemy.angle),
+			&texture_center,
+			.NONE,
+		),
+	) or_return
+
+	// healthbar
+
+	// bg
+	health_rect := texture_rect
+	health_rect.h = 6
+	sdl_exec(
+		SDL.SetRenderDrawColor(ctx.renderer, expand_values(SDL.Color{255, 200, 200, 255})),
+	) or_return
+	sdl_exec(SDL.RenderFillRectF(ctx.renderer, &health_rect)) or_return
+
+	// fg
+	health_rect.w *= enemy.health / enemy.max_health
+	sdl_exec(
+		SDL.SetRenderDrawColor(ctx.renderer, expand_values(SDL.Color{255, 100, 100, 255})),
+	) or_return
+	sdl_exec(SDL.RenderFillRectF(ctx.renderer, &health_rect)) or_return
+
+	// border
+	health_rect.w = TILE_SIZE
+	sdl_exec(
+		SDL.SetRenderDrawColor(ctx.renderer, expand_values(SDL.Color{0, 0, 0, 255})),
+	) or_return
+	sdl_exec(SDL.RenderDrawRectF(ctx.renderer, &health_rect)) or_return
+
+	return
+}
+
 
 Level :: struct {
 	using _:      SDL.Rect,
@@ -219,14 +308,14 @@ Level :: struct {
 	tiles:        [dynamic]Tile,
 	hovered_tile: int,
 	towers:       [dynamic]Tower,
-	path:         []PathEndpoint,
+	path:         []Coords,
 	enemy:        Enemy,
 }
 
 level_init :: proc(
 	level: ^Level,
 	level_map: string,
-	path: []PathEndpoint,
+	path: []Coords,
 	allocator := context.allocator,
 ) {
 	level.hovered_tile = -1
@@ -261,12 +350,12 @@ level_init :: proc(
 		r, c := i32(row), i32(col)
 
 		t_idx := row * level.cols + col
-		level.tiles[t_idx] = Tile{r, c, lt} // left top
-		level.tiles[t_idx + 1] = Tile{r, c + 1, rt} // right top
+		level.tiles[t_idx] = Tile{Coords{c, r}, lt} // left top
+		level.tiles[t_idx + 1] = Tile{Coords{c + 1, r}, rt} // right top
 
 		b_idx := (row + 1) * level.cols + col
-		level.tiles[b_idx] = Tile{r + 1, c, lb} // left bottom
-		level.tiles[b_idx + 1] = Tile{r + 1, c + 1, rb} // right bottom
+		level.tiles[b_idx] = Tile{Coords{c, r + 1}, lb} // left bottom
+		level.tiles[b_idx + 1] = Tile{Coords{c + 1, r + 1}, rb} // right bottom
 	}
 
 	row, col := 0, 0
@@ -353,26 +442,26 @@ ui_coords :: proc(ui: ^Ui, ctx: ^Context) {
 	ui.y = ctx.window_height / 2 - (ui.cards * ui.card_h + ui.padding * (ui.cards - 2)) / 2
 }
 
-render_circle :: proc(ctx: ^Context, color: SDL.Color, cx, cy, r: i32) -> (err: Error) {
-	x: i32 = 0
+render_circle :: proc(ctx: ^Context, color: SDL.Color, cx, cy, r: f32) -> (err: Error) {
+	x: f32 = 0
 	y := -r
 	ymp := -(f32(r) - 0.5)
 
 	sdl_exec(SDL.SetRenderDrawColor(ctx.renderer, expand_values(color))) or_return
 
 	for x < -y {
-		sdl_exec(SDL.RenderDrawPoint(ctx.renderer, cx + x, cy + y)) or_return
-		sdl_exec(SDL.RenderDrawPoint(ctx.renderer, cx + x, cy - y)) or_return
-		sdl_exec(SDL.RenderDrawPoint(ctx.renderer, cx - x, cy + y)) or_return
-		sdl_exec(SDL.RenderDrawPoint(ctx.renderer, cx - x, cy - y)) or_return
+		sdl_exec(SDL.RenderDrawPointF(ctx.renderer, cx + x, cy + y)) or_return
+		sdl_exec(SDL.RenderDrawPointF(ctx.renderer, cx + x, cy - y)) or_return
+		sdl_exec(SDL.RenderDrawPointF(ctx.renderer, cx - x, cy + y)) or_return
+		sdl_exec(SDL.RenderDrawPointF(ctx.renderer, cx - x, cy - y)) or_return
 
-		sdl_exec(SDL.RenderDrawPoint(ctx.renderer, cx + y, cy + x)) or_return
-		sdl_exec(SDL.RenderDrawPoint(ctx.renderer, cx - y, cy + x)) or_return
-		sdl_exec(SDL.RenderDrawPoint(ctx.renderer, cx + y, cy - x)) or_return
-		sdl_exec(SDL.RenderDrawPoint(ctx.renderer, cx - y, cy - x)) or_return
+		sdl_exec(SDL.RenderDrawPointF(ctx.renderer, cx + y, cy + x)) or_return
+		sdl_exec(SDL.RenderDrawPointF(ctx.renderer, cx - y, cy + x)) or_return
+		sdl_exec(SDL.RenderDrawPointF(ctx.renderer, cx + y, cy - x)) or_return
+		sdl_exec(SDL.RenderDrawPointF(ctx.renderer, cx - y, cy - x)) or_return
 
 		x += 1
-		if f32(x * x) + ymp * ymp > f32(r * r) {
+		if x * x + ymp * ymp > r * r {
 			y += 1
 			ymp += 1
 		}
@@ -381,23 +470,7 @@ render_circle :: proc(ctx: ^Context, color: SDL.Color, cx, cy, r: i32) -> (err: 
 	return
 }
 
-render_tower :: proc(ctx: ^Context, rect: SDL.Rect, show_range: bool) -> (err: Error) {
-	rect := rect
-	sdl_exec(SDL.RenderCopy(ctx.renderer, ctx.textures[.Base], nil, &rect)) or_return
-
-	tower_r := rect
-	tower_r.y -= 5
-	sdl_exec(SDL.RenderCopy(ctx.renderer, ctx.textures[.Tower], nil, &tower_r)) or_return
-
-	if show_range {
-		cx, cy := rect.x + rect.w / 2, rect.y + rect.h / 2
-		render_circle(ctx, SDL.Color{255, 0, 0, 255}, cx, cy, TOWER_RANGE_RADIUS) or_return
-	}
-
-	return
-}
-
-position_to_pixels :: proc(level: ^Level, col, row, w, h: i32) -> (x, y: i32) {
+position_to_pixels_i32 :: proc(level: ^Level, col, row, w, h: i32) -> (x, y: i32) {
 	x = level.x + col * w
 	y = level.y + row * h
 	return
@@ -425,7 +498,7 @@ render :: proc(ctx: ^Context, level: ^Level, ui: ^Ui) -> (err: Error) {
 		}
 
 		for tile, idx in level.tiles {
-			r.x, r.y = position_to_pixels(level, tile.col, tile.row, TILE_SIZE, TILE_SIZE)
+			r.x, r.y = position_to_pixels_i32(level, tile.col, tile.row, TILE_SIZE, TILE_SIZE)
 
 			switch t in tile.type {
 			case TileGround:
@@ -445,39 +518,28 @@ render :: proc(ctx: ^Context, level: ^Level, ui: ^Ui) -> (err: Error) {
 	{ 	// render path
 		sdl_exec(SDL.SetRenderDrawColor(ctx.renderer, expand_values(ctx.point_clr))) or_return
 
-		x1, y1: i32
+		prev_pos: Vec2
 		for p, i in level.path {
-			x2, y2 := position_to_pixels(level, p.col, p.row, TILE_SIZE, TILE_SIZE)
-			x2 += TILE_SIZE
-			y2 += TILE_SIZE
-
+			pos := coords_to_pixels_center(level, p, PATH_SIZE, PATH_SIZE)
 			if i > 0 {
-				sdl_exec(SDL.RenderDrawLine(ctx.renderer, x1, y1, x2, y2)) or_return
+				sdl_exec(
+					SDL.RenderDrawLineF(ctx.renderer, expand_values(prev_pos), expand_values(pos)),
+				) or_return
 			}
-
-			x1, y1 = x2, y2
+			prev_pos = pos
 		}
 	}
 
 	{ 	// render towers
-		r := SDL.Rect {
-			w = TILE_SIZE,
-			h = TILE_SIZE,
-		}
-		for tower in level.towers {
-			r.x, r.y = position_to_pixels(level, tower.col, tower.row, TILE_SIZE, TILE_SIZE)
-			render_tower(ctx, r, true) or_return
+		for &tower in level.towers {
+			tower_render(ctx, level, &tower) or_return
 		}
 	}
 
 	{ 	// render enemies
-		r := SDL.FRect {
-			x = level.enemy.x,
-			y = level.enemy.y,
-			w = TILE_SIZE,
-			h = TILE_SIZE,
+		if level.enemy.health > 0 {
+			enemy_render(ctx, level, &level.enemy) or_return
 		}
-		sdl_exec(SDL.RenderCopyF(ctx.renderer, ctx.textures[.Enemy], nil, &r)) or_return
 	}
 
 	// highlight
@@ -505,7 +567,7 @@ render :: proc(ctx: ^Context, level: ^Level, ui: ^Ui) -> (err: Error) {
 			w = TILE_SIZE,
 			h = TILE_SIZE,
 		}
-		r.x, r.y = position_to_pixels(level, tile.col, tile.row, TILE_SIZE, TILE_SIZE)
+		r.x, r.y = position_to_pixels_i32(level, tile.col, tile.row, TILE_SIZE, TILE_SIZE)
 
 		sdl_exec(SDL.SetRenderDrawColor(ctx.renderer, expand_values(highlight_clr))) or_return
 		sdl_exec(SDL.RenderFillRect(ctx.renderer, &r)) or_return
@@ -513,50 +575,67 @@ render :: proc(ctx: ^Context, level: ^Level, ui: ^Ui) -> (err: Error) {
 
 
 	{ 	// render ui
-		mouse_x, mouse_y := ctx.mouse.x, ctx.mouse.y
+		mouse_x, mouse_y := f32(ctx.mouse.x), f32(ctx.mouse.y)
 
-		x := ui.x
-		y := ui.y
+		x := f32(ui.x)
+		y := f32(ui.y)
 
 		for i in 0 ..< ui.cards {
 			temp_x, temp_y := x, y
 			defer {
 				x = temp_x
 				y = temp_y
-				y += ui.card_h + ui.padding
+				y += f32(ui.card_h + ui.padding)
 			}
 
-			w, h := ui.card_w, ui.card_h
-			tower_w, tower_h: i32 = 32, 32
+			w, h := f32(ui.card_w), f32(ui.card_h)
+			tower_w, tower_h: f32 = 32, 32
 
 			if i == ui.card_clicked {
 				w = 32
 				h = 32
-				x = mouse_x - min(ui.card_click_pos.x, w)
-				y = mouse_y - min(ui.card_click_pos.y, h)
+				x = mouse_x - min(f32(ui.card_click_pos.x), w)
+				y = mouse_y - min(f32(ui.card_click_pos.y), h)
 
 				tower_w, tower_h = 20, 20
 			} else {
-				inside_x := mouse_x >= x && mouse_x <= x + ui.card_w
-				inside_y := mouse_y >= y && mouse_y <= y + ui.card_h
+				inside_x := mouse_x >= x && mouse_x <= x + f32(ui.card_w)
+				inside_y := mouse_y >= y && mouse_y <= y + f32(ui.card_h)
 
 				if inside_x && inside_y {
 					y -= 5
 				}
 			}
 
-			card_r := SDL.Rect{x, y, w, h}
+			card_r := SDL.FRect{x, y, w, h}
 			sdl_exec(
-				SDL.RenderCopy(ctx.renderer, ctx.textures[.CardTower], nil, &card_r),
+				SDL.RenderCopyF(ctx.renderer, ctx.textures[.CardTower], nil, &card_r),
 			) or_return
 
-			base_r := SDL.Rect {
+			base_rect := SDL.FRect {
 				x = card_r.x + card_r.w / 2 - tower_w / 2,
 				y = card_r.y + card_r.h / 2 - tower_h / 2,
 				w = tower_w,
 				h = tower_h,
 			}
-			render_tower(ctx, base_r, i == ui.card_clicked) or_return
+			sdl_exec(SDL.RenderCopyF(ctx.renderer, ctx.textures[.Base], nil, &base_rect)) or_return
+
+			tower_rect := base_rect
+			tower_rect.y -= tower_rect.h * 0.15
+			sdl_exec(
+				SDL.RenderCopyF(ctx.renderer, ctx.textures[.Tower], nil, &tower_rect),
+			) or_return
+
+			if i == ui.card_clicked {
+				cx, cy := base_rect.x + tower_w / 2, base_rect.y + tower_h / 2
+				render_circle(
+					ctx,
+					SDL.Color{255, 100, 100, 255},
+					cx,
+					cy,
+					TOWER_RANGE_RADIUS,
+				) or_return
+			}
 		}
 	}
 
@@ -719,7 +798,7 @@ main :: proc() {
 		"x#####xxxx\n" +
 		"x#xxxxxxxx\n" +
 		"x#xxxxxxxx\n"
-	levelPath := []PathEndpoint {
+	levelPath := []Coords {
 		{10, -1},
 		{10, 2},
 		{18, 2},
@@ -736,6 +815,8 @@ main :: proc() {
 	level: Level
 	level.enemy = Enemy {
 		endpoint_idx = -1,
+		health       = 100,
+		max_health   = 100,
 	}
 	level_init(&level, levelTiles, levelPath)
 	level_coords(&level, &ctx)
@@ -818,7 +899,9 @@ main :: proc() {
 								}
 							}
 							if !exists {
-								append(&level.towers, Tower{row = tile.row, col = tile.col})
+								tower: Tower
+								tower_init(&tower, tile)
+								append(&level.towers, tower)
 							}
 						}
 
@@ -863,56 +946,66 @@ main :: proc() {
 		{ 	// enemy
 			enemy := &level.enemy
 
-			switch {
-			// not spawned
-			case enemy.endpoint_idx == -1:
-				x, y := position_to_pixels(
-					&level,
-					level.path[0].col,
-					level.path[0].row,
-					TILE_SIZE,
-					TILE_SIZE,
-				)
-				x += TILE_SIZE / 2
-				y += TILE_SIZE / 2
-
-				enemy.x = f32(x)
-				enemy.y = f32(y)
-				enemy.endpoint_idx += 1
-			// reached end
-			case enemy.endpoint_idx == len(level.path) - 1:
-
-			// moving
-			case:
-				from, to := level.path[enemy.endpoint_idx], level.path[enemy.endpoint_idx + 1]
-
-				fromx, fromy := position_to_pixels(
-					&level,
-					from.col,
-					from.row,
-					TILE_SIZE,
-					TILE_SIZE,
-				)
-				tox, toy := position_to_pixels(&level, to.col, to.row, TILE_SIZE, TILE_SIZE)
-
-				distance_x := clamp(f32(tox - fromx), -1, 1)
-				distance_y := clamp(f32(toy - fromy), -1, 1)
-
-				dx := distance_x * ENEMY_PX_PER_SECOND * ctx.dt
-				dy := distance_y * ENEMY_PX_PER_SECOND * ctx.dt
-
-				enemy.x += dx
-				enemy.y += dy
-
+			if enemy.health > 0 {
 				switch {
-				case distance_x < 0 && enemy.x <= f32(tox + TILE_SIZE / 2):
+				// not spawned
+				case enemy.endpoint_idx == -1:
+					enemy.rel_pos = 0
 					enemy.endpoint_idx += 1
-				case distance_x > 0 && enemy.x >= f32(tox + TILE_SIZE / 2):
-					enemy.endpoint_idx += 1
-				case distance_y > 0 && enemy.y >= f32(toy + TILE_SIZE / 2):
-					enemy.endpoint_idx += 1
-				case distance_y < 0 && enemy.y <= f32(toy + TILE_SIZE / 2):
-					enemy.endpoint_idx += 1
+				// reached end
+				case enemy.endpoint_idx == len(level.path) - 1:
+
+				// moving
+				case:
+					start := coords_to_pixels_center(
+						&level,
+						level.path[enemy.endpoint_idx],
+						PATH_SIZE,
+						PATH_SIZE,
+					)
+					target := coords_to_pixels_center(
+						&level,
+						level.path[enemy.endpoint_idx + 1],
+						PATH_SIZE,
+						PATH_SIZE,
+					)
+					path_distance := target - start
+					enemy.angle = math.to_degrees(math.atan2(path_distance.y, path_distance.x))
+
+					to_target := path_distance - enemy.rel_pos
+
+					dist := linalg.length(to_target)
+					step := ENEMY_PX_PER_SECOND * ctx.dt
+
+					if dist <= step {
+						enemy.rel_pos = 0
+						enemy.endpoint_idx += 1
+					} else {
+						dir := to_target / dist
+						enemy.rel_pos += dir * step
+					}
+				}
+			}
+		}
+
+		{ 	// towers
+			enemy := &level.enemy
+			enemy_pos, ok := enemy_abs_position(&level, enemy)
+
+			if enemy.health > 0 && ok {
+				for &tower in level.towers {
+					tower_pos := coords_to_pixels_center(&level, tower, TILE_SIZE, TILE_SIZE)
+					dist := enemy_pos - tower_pos
+					dist_len := linalg.length(enemy_pos - tower_pos)
+
+					if dist_len < tower.range_radius {
+						tower.angle = 90 + math.to_degrees(math.atan2(dist.y, dist.x))
+
+						if time.tick_since(tower.last_shot) >= tower.shooting_frequency {
+							enemy.health -= tower.damage
+							tower.last_shot = time.tick_now()
+						}
+					}
 				}
 			}
 		}
